@@ -1,0 +1,670 @@
+---
+title: "MS2_model"
+output:
+  html_document:
+    css: style.css
+    fig_width: 5
+    highlight: textmate
+    keep_md: yes
+    theme: journal
+    toc: yes
+    toc_float:
+      collapsed: yes
+  pdf_document:
+    toc: yes
+---
+
+
+
+```{r setup, include=FALSE}
+# warnings on/off
+oldw <- getOption("warn")
+options(warn = -1)
+
+knitr::opts_chunk$set(echo = TRUE, warnings=FALSE, fig.path="figures/", dev=c("jpeg", "pdf"))
+library(ggplot2)
+library(gridExtra)
+library(randomForest)
+library(mice)
+library(reshape)
+library(mgcv)
+library(fitdistrplus)
+library(caret)
+library(gbm)
+
+```
+
+```{r load workspace}
+extinct.raw <- read.csv("model_data2.csv")
+extinct <- extinct.raw[,c("ma_range", "lat_range", "gcd", "svl", "mean_lat",
+                 "min_lat", "abu_cat")]
+extant <- read.csv("living_data2.csv")
+extant <- extant[,-c(1,2)]
+names(extant) <- c("species", "svl", "count", "abu_cat", "lat_range", "gcd", "mean_lat", "min_lat",
+                                 "Red.List.status", "order", "family", "genus", "hab.cat.b")
+```
+
+
+# Data description
+## Extant
+```{r description extant data}
+nrow(na.omit(extant))
+summary(extant)
+```
+
+
+```{r }
+extant <- na.omit(extant)
+extant <- droplevels(extant)
+summary(extant)
+
+hist(extant$svl)
+barplot(table(extant$abu_cat))
+hist(extant$lat_range)
+hist(extant$gcd)
+hist(extant$mean_lat)
+hist(extant$min_lat)
+```
+
+`r nrow(extant)` complete cases in the data. Body size distribution as expected (follows a negative binomial, cut off at the lower end).
+
+```{r}
+ggplot(extant, aes(Red.List.status))+geom_bar()#+scale_y_log10()#+scale_y_continuous(limits = c(0,200), oob = squish)
+```
+
+
+```{r}
+ggplot(extant, aes(hab.cat.b))+geom_bar()+scale_y_log10()#limits = c(0,400), oob = squish)
+```
+
+Habitat distribution looks similar to extinct species. Only very few species from high energy habitats only.
+
+
+
+
+## Comparability with fossil data
+Data from the fossil record and from living species can differ greatly, but also share some common points. Data on geographic ranges, body size and habitat are comparable without further adjustments (?), whereas comparing data on abundance from extinct and living species would be most likely to the disadvantage of the extinct species, caused by the in general low preservation probability of terrestrial organisms. Another variable that is not comparable without further adjustments is extinction risk, wich is defined as species duration in the fossil record, but as category in the IUCN Red List. 
+To bridge these differences between datasets, we chose to categorize data for abundance (mni_max and spec_max) and extinction risk (duration) for the extinct species data. 
+
+
+Applying the fossil data fitted model I will predict duration for extant species, which can be compared to their current assassment categories. Therefore, only abundance categorization has to be done.
+We regard EW and EX to be of the same results and therefore similar for our approach. DD species is not a category for extinction risk, therefore there is 6 categories for living species, which is in increasing order: LC, NT, VU, EN, CR, and EX.
+
+
+
+# Modelling
+## Data imputation
+Data was imputed for missing cases of bodysize (svl) and abundance categories. This allows us to use all `r nrow(extinct)` 
+We excluded habitat category from our data prior to calculations as we have shown that it`s influence on extinction risk seems to be reversed by human activities. Imputation was performed using the mice package, using the average results of 50 imputation repetitions. Procedures and imputation validation can be found in the supplement. 
+```{r imputation}
+extinct.imp <- extinct.raw[,c("ma_range", "lat_range", "gcd", "svl", "mean_lat",
+                 "min_lat", "abu_cat")]
+extinct.imp$abu_cat <- as.factor(extinct.imp$abu_cat) # set abundance as factor
+
+imputation_rf_svl <- matrix(ncol=50, nrow=nrow(extinct.imp))
+imputation_rf_abu <- matrix(ncol=50, nrow=nrow(extinct.imp))
+for(i in 1:50){
+  imputed <- rfImpute(extinct.imp, extinct$ma_range)
+  imputation_rf_svl[,i] <- imputed$svl
+  imputation_rf_abu[,i] <- imputed$abu_cat
+}
+
+# Using mice package
+imputed <- mice(extinct.imp, maxit=20, m=50, print=FALSE, method = c("", "", "", "rf", "", "", "polr")) # polr
+# use default imputation method for bodysize and polr instead of default polyreg (abu is an ordered factor)
+plot(imputed, c("svl", "abu_cat")) # check convergence of the predictor algorithm
+
+# combine the multiple iterations into one mean imputed value
+temp <- complete(imputed, action="broad", include=TRUE)
+imputation_mice_svl <- temp[,grepl(pattern = "svl.[1-9]", x = names(temp))] # grab all imputed svl columns
+imputation_mice_abu <- temp[,grepl(pattern = "abu_cat.[1-9]", x = names(temp))] # grab all imputed abu columns
+
+# Impossible values?
+table((imputation_rf_svl<=0))
+table((imputation_mice_svl<=0))
+
+# PLOTS
+## plot densities to check if imputations are reasonable
+grid.arrange(
+ggplot(melt(imputation_rf_svl), aes(x=value))+
+  geom_density(aes(group=X2, col="orange"), show.legend = FALSE)+
+  geom_density(data=extinct.imp, aes(x=svl), col="blue"),
+ggplot(melt(imputation_mice_svl), aes(x=value))+
+  geom_density(aes(group=variable, col="orange"), show.legend = FALSE)+
+  geom_density(data=extinct.imp, aes(x=svl), col="blue"))
+
+grid.arrange(
+ggplot(melt(imputation_rf_abu), aes(x=value))+
+  geom_density(aes(group=X2, col="orange"), show.legend = FALSE)+
+  geom_density(data=extinct.imp, aes(x=as.numeric(as.character(extinct.imp$abu_cat))), col="blue"),
+ggplot(melt(as.matrix(imputation_mice_abu)), aes(x=value))+
+  geom_density(aes(group=X2, col="orange"), show.legend = FALSE)+
+  geom_density(data=extinct.imp, aes(x=as.numeric(as.character(extinct.imp$abu_cat))), col="blue"))
+## Mean imputated values
+par(mfrow=c(2,1))
+which_svl_imp <- as.numeric(row.names(imputed$imp$svl))
+boxplot(t(imputation_rf_svl[which_svl_imp,]), main="imputation random forest")
+boxplot(t(imputation_mice_svl[which_svl_imp,]), main="imputation mice")
+# ignore the numbering, first plot reasigns the row numbers, second keeps the old ones
+
+imputation_mice_abu <- apply(imputation_mice_abu, 2, function(x) as.numeric(as.character(x)))
+boxplot(t(imputation_rf_abu)); boxplot(t(imputation_mice_abu))
+
+# check for sd of the imputed data. values==0 are the not imputed data
+#imputation_rf_abu <- apply(imputation_rf_abu, 2, function(x) as.numeric(as.character(x)))
+hist(apply(imputation_rf_svl, 1, sd)); hist(apply(imputation_mice_svl, 1, sd)) 
+hist(apply(imputation_rf_abu, 1, sd), breaks=20); hist(apply(imputation_mice_abu, 1, sd), breaks=20)
+psych::describe(apply(imputation_rf_abu, 1, sd), IQR=TRUE)
+psych::describe(apply(imputation_mice_abu, 1, sd), IQR=TRUE)
+
+par(mfrow=c(1,1))
+plot(rowMeans(imputation_mice_svl), rowMeans(imputation_rf_svl), alpha=0.5)
+text(100, 3000, round(cor(rowMeans(imputation_mice_svl), rowMeans(imputation_rf_svl)),2))
+plot(rowMeans(imputation_mice_abu), rowMeans(imputation_rf_abu))
+text(4, 1.2, round(cor(rowMeans(imputation_mice_abu), rowMeans(imputation_rf_abu)),2))
+
+# Add the imputed data
+extinct.imp$svl <- rowMeans(imputation_mice_svl)
+
+extinct.imp$abu_cat  <- as.factor(apply(imputation_mice_abu, 1, 
+                                        function(x) names(sort(table(x), decreasing = TRUE))[1]))
+
+extinct.imp <- cbind(extinct.imp, extinct.raw[,c("species", "order", "family", "genus", "complete_case")])
+imp <- extinct.imp[,c("ma_range", "lat_range", "gcd", "svl", "mean_lat",
+                 "min_lat", "abu_cat")]
+
+```
+Data imputation with mice takes the categorical and numeric characteristics of abundance and bodysize into account and allows for multiple methods. Imputed body size with randomForest has smaller sd for multiple imputations, but the mice density distribution of the imputations follows the real data better (Although both use a randomforest algorithm). The correlation between both imputation methods is high. 
+Abundance is on average predicted higher with randomForest than with mice and correlates poorly between both methods. The sd for randomforest imputations is smaller (when treated as a numeric variable) in mean and median values, the maximum sd is higher.
+We chose to use the mice::mice function for data imputation.
+
+
+### Analyze data imputation 
+```{r imputation_analysis}
+svl_imputed <- extinct$svl==extinct.imp$svl
+svl_imputed <- !is.na(svl_imputed)
+abu_cat_imputed <- extinct$abu_cat==extinct.imp$abu_cat
+abu_cat_imputed <- !is.na(abu_cat_imputed)
+extinct.imp <- cbind(extinct.imp, svl_imputed, abu_cat_imputed) 
+
+round(tapply(extinct.imp$svl_imputed, extinct.raw$order, sum)/
+        tapply(extinct.imp$svl_imputed, extinct.raw$order, length),2)
+round(tapply(extinct.imp$abu_cat_imputed, extinct.raw$order, sum)/
+        tapply(extinct.imp$abu_cat_imputed, extinct.raw$order, length),2)
+
+ggplot(extinct.imp[is.na(extinct.imp$order)==FALSE,], aes(svl, fill=svl_imputed))+
+  geom_histogram()+
+  scale_fill_hue("svl imputed")+
+  xlab("svl length")+
+  theme_classic()+
+  facet_grid(order ~ .)
+ggplot(extinct.imp[is.na(extinct.imp$order)==FALSE,], aes(abu_cat, fill=abu_cat_imputed))+
+  geom_bar()+
+  scale_fill_hue("abundance imputed")+
+  xlab("abundance category")+
+  theme_classic()+
+  facet_grid(order ~ .)
+```
+
+Data imputed is only data on abundance and body size.
+
+## Distribution check
+```{r distribution check}
+my_data <- extinct$ma_range
+plot(my_data, pch=20)
+plotdist(my_data, histo=TRUE, demp=TRUE)
+descdist(my_data, discrete=FALSE, boot=500)
+```
+According to fitdistrplus::descdist the response variable shows a beta distribution.
+
+
+
+
+## Generalized additive model
+GAM was fitted to the data to allow for non-linear relationships between the predictor variables and the species duration. 
+Normality (qq plot) and homogeneity are violated (residuals vs. fitted values (linear predictor)).
+
+Family for the model: nb theta estimation does not work so I can only get the gebin(x) working, which vastly overfits the model and results in just 2 variables being significant. As normal distribution is the worst choice here, i do poisson without log-transformation of the duration data.
+
+Zuur on chosing a smoother: "In practise, the difference between cubic regression splines, thin plate regression splines, B-splines, P-splines, etc., is rather small". 
+
+method and select of the mgcv::gam() are being chosen using the caret::train() function.
+
+
+```{r gam}
+# logging the skewed variables
+imp2 <- log(imp[,c("ma_range", "lat_range", "gcd", "svl")]+1)
+imp2$mean_lat <- imp$mean_lat; imp2$min_lat <- imp$min_lat; imp2$abu_cat <- imp$abu_cat;
+extinct2 <- log(extinct[,c("ma_range", "lat_range", "gcd", "svl")]+1)
+extinct2$mean_lat <- extinct$mean_lat; extinct2$min_lat <- extinct$min_lat; extinct2$abu_cat <- extinct$abu_cat;
+
+gam.incomp <- gam(data=extinct, ma_range ~ s(lat_range) + s(gcd) + s(svl) + s(mean_lat) +
+                  s(min_lat) + s(as.numeric(as.character(abu_cat)), k=4))
+gam.incomp.log <- gam(data=extinct2, ma_range ~ s(lat_range) + s(gcd) + s(svl) + s(mean_lat) +
+                  s(min_lat) + s(as.numeric(as.character(abu_cat)), k=4))
+gam.imp <- gam(data=imp, ma_range ~ s(lat_range) + s(gcd) + s(svl) + s(mean_lat) +
+                s(min_lat) + s(as.numeric(as.character(abu_cat)), k=4))
+gam.imp.log <- gam(data=imp2, ma_range ~ s(lat_range) + s(gcd) + s(svl) + s(mean_lat) +
+                s(min_lat) + s(as.numeric(as.character(abu_cat)), k=4))
+
+summary(gam.incomp)
+summary(gam.incomp.log)
+summary(gam.imp)
+summary(gam.imp.log)
+
+par(mfrow=c(2,2))
+gam.check(gam.incomp)
+gam.check(gam.incomp.log)
+gam.check(gam.imp)
+gam.check(gam.imp.log)
+par(mfrow=c(1,1))
+
+# Chose model gam.imp. Adjust family?
+gam.imp <- gam(data=imp, ma_range ~ s(lat_range) + s(gcd) + s(svl) + s(mean_lat) +
+                s(min_lat) + s(as.numeric(as.character(abu_cat)), k=4), method="REML")
+gam.imp.new <- gam(data=imp, ma_range ~ s(lat_range) + s(gcd) + s(svl) + s(mean_lat) +
+                s(min_lat) + s(as.numeric(as.character(abu_cat)), k=4),
+               family = nb())
+summary(gam.imp.new)
+par(mfrow=c(2,2))
+gam.check(gam.imp.new)
+par(mfrow=c(1,1))
+plot(imp$ma_range~gam.imp.new$fitted.values, xlim=c(0,20))
+
+# Choose standard family, as negative binomial looks overfitted (very high deviance explained), has huuuge outliers.
+# The r squared value points, despite the better AIC and deviance, to a fitting problem
+final.gam <- gam.imp
+
+# Predict
+predict.gam <- predict.gam(gam.imp, newdata = extant)
+range(predict.gam) # there is lots of negative predictions in the gam; adjust:
+predict.gam <- predict.gam+abs(min(predict.gam))
+
+res <- extant
+res$Red.List.status <- ordered(res$Red.List.status, levels = c("DD", "LC", "NT", "VU", "EN", "CR", "EW", "EX"))
+res$predict.gam <- predict.gam
+
+library(ggthemes)
+theme=theme_set(theme_minimal()) 
+
+(gam.fin <- ggplot(res, aes(x=Red.List.status, y=log(predict.gam)))+
+    geom_boxplot(outlier.colour=NULL, colour="#FF9999", fill="#FF9999")+
+    scale_y_continuous("predicted duration (log ma)")+
+    stat_summary(geom = "crossbar", 
+                 width=0.65, fatten=.5, 
+                 color="black", 
+                 fun.data = function(x){return(c(y=median(x), ymin=median(x), ymax=median(x)))})
+)  
+
+
+library(reshape)
+res2 <- melt(res[,c("Red.List.status", "predict.gam")])
+
+kruskal.test(res$predict.gam, res$Red.List.status)
+pairwise.wilcox.test(res$predict.gam, res$Red.List.status, p.adjust.method = "fdr")
+```
+
+
+
+## Random Forest
+```{r random forest}
+# Set seeds and parameters for cross validation for parameter tuning with caret::train()
+set.seed(432)
+mySeeds <- sapply(simplify = FALSE, 1:31, function(u) sample(10^4, 5))
+
+fitControl <- trainControl(method = "repeatedcv", number = 10,
+                           repeats = 3, seeds = mySeeds,
+                           returnResamp = "all",
+                           savePredictions = "final") ## 3 times 10-fold CV
+rfFit1 <- train(ma_range ~ ., data = imp, method = "rf", 
+                trControl = fitControl, verbose = FALSE,
+                na.action = na.pass,
+                tuneGrid=data.frame(mtry=c(2,3,4,5,6)),
+                importance=TRUE)
+rfFit1
+rfFit1$finalModel
+ggplot(rfFit1)
+
+plot(rfFit1$finalModel)
+varImpPlot(rfFit1$finalModel)
+
+### PREDICTION ####
+if(class(extant$abu_cat)=="integer"){extant$abu_cat <- as.factor(extant$abu_cat)}
+predict.rf <- predict(rfFit1, newdata = extant)
+res$predict.rf <- predict.rf
+
+res2 <- melt(res[,c("Red.List.status", "predict.gam", "predict.rf")])
+
+theme=theme_set(theme_minimal()) 
+
+ggplot(res2, aes(x=Red.List.status, y=log(value)))+
+ geom_boxplot(aes(fill=variable))
+#   geom_boxplot(outlier.colour=NULL, aes(fill=variable, colour=variable))+
+#  scale_y_continuous("predicted duration (log ma)")+
+#  stat_summary(geom = "crossbar", 
+#               width=0.65, fatten=1, 
+#               color="black", 
+#               fun.data = function(x){return(c(y=median(x), ymin=median(x), ymax=median(x)))})
+
+kruskal.test(res$predict.rf, res$Red.List.status)
+pairwise.wilcox.test(res$predict.rf, res$Red.List.status, p.adjust.method = "fdr")
+
+
+```
+
+Imputing the data does neither change prediction results or the importance of the single variables too much, but it does increase the variance explained and R squared
+
+
+
+
+
+
+## Generalized boosted model ##
+Generalized boosted models are regular regression models that are being boosted, means that they are being repeated according to the error parameters of the previous model, again and again. The cross validation can be performed by classic division of data into training and evaluation set. These models do not care about missing data, that`s a plus. They make minimal assumptions about the parameters that are being entered, however collinearity can be a problem, GBMs proof to be relatively tolerant to multicolinearity for prediction (Finnegan 2015 [see ref. 73])
+```{r generalized boosted regression models}
+# parameter tuning using caret
+gbmControl <- trainControl(method = "repeatedcv", number = 10,
+                           repeats = 3, savePredictions = "final")
+
+gbmGrid <-  expand.grid(interaction.depth = c(1, 2, 3), 
+                        n.trees = (1:10)*50, 
+                        shrinkage = c(0.1, 0.01, 0.001),
+                        n.minobsinnode = c(5, 10, 15))
+set.seed(825)
+gbmFit1 <- train(ma_range ~ ., data = imp, method = "gbm", 
+                 trControl = gbmControl, verbose=FALSE,
+                 tuneGrid=gbmGrid)
+
+gbmFit1
+gbm.perf(gbmFit1$finalModel)
+ggplot(gbmFit1, nameInStrip = TRUE)
+ggplot(as.data.frame(summary(gbmFit1)),
+                  aes(x=var, y=rel.inf))+
+  geom_col()
+
+## Prediction
+predict.gbm1 <- predict(gbmFit1, newdata = extant, n.trees = gbmFit1$bestTune$n.trees)
+res$predict.gbm1 <- predict.gbm1
+
+ggplot(res, aes(x=Red.List.status, y=predict.gbm1))+
+  geom_boxplot(varwidth=TRUE)+
+  scale_y_log10("predicted duration (log ma)")
+
+#### add to other model results
+res2 <- melt(res[,c("Red.List.status", "predict.gam", "predict.rf", 
+                    "predict.gbm1")])
+ggplot(res2, aes(x=Red.List.status, y=value))+
+  geom_boxplot(aes(fill=variable))+
+  scale_y_log10("predicted duration (log ma)")#+
+#  facet_wrap(~variable)
+
+kruskal.test(res$predict.gbm1, res$Red.List.status)
+pairwise.wilcox.test(res$predict.gbm1, res$Red.List.status, p.adjust.method = "fdr")
+
+```
+
+
+Models are quite immune to overfitting and can also deal with correlations of variables. GBM also handles missing data. GBMs make minimal assumptions about the relationship between predictors and response and prioritize predictive performance over probabilistic inference about the model itself.
+
+
+# More cross validation, and taxonomic-group level mean bias?
+The calibration here can basically be done with any other model as well. For now I am using gbm() as I follow the supplementary material of Finnegan et al. 2015 (Science). 
+Assessing the prediction quality is done by using only part of the data to build the model and evaluate it on the remaining data.
+
+
+Note that the predicted values are always smaller than the observed ones. The reason is likely the skewed response variable. Removing 50\% of the data causes the model to be likely fitted on small duration species only. Using more data on building the model to increase the chance of including a broader variety of the response variable values does not change this however.
+
+### Cross validation bootstrap
+```{r gbm cross validation bootstrap}
+size_modelset <- 1/2
+fin <- c()
+n <- 500
+set.seed(346)
+interval.range <- 10
+interval.size <- 0.5
+
+for(i in 1:n){
+  sub <- extinct.imp[sample(seq(1:nrow(extinct.imp)), nrow(extinct.imp)*size_modelset, replace = FALSE),]
+  eval <- extinct.imp[-as.numeric(row.names(sub)),]
+  gbm.sub <- gbm(ma_range ~ lat_range+gcd+svl+mean_lat+min_lat+abu_cat
+                 , data = sub,
+                 n.trees=gbmFit1$finalModel$n.trees, 
+                 shrinkage = gbmFit1$finalModel$shrinkage,
+                 interaction.depth=gbmFit1$finalModel$interaction.depth)
+  best.iter.sub <- gbm.perf(gbm.sub, method="OOB", plot.it=FALSE)
+  pre <- predict.gbm(gbm.sub, eval, best.iter.sub)
+    # manually assign every prediction smaller than 0 to be 0 for technical reasons
+  pre[pre<0] <- 0
+  
+  # group the predicted durations into bins
+  g <- findInterval(pre, seq(0, interval.range, interval.size))
+  cc <- data.frame(prediction=pre, interval=g, species=eval$species, ma_range=eval$ma_range, order=eval$order)
+  
+  # now calculate what was the actual observed duration of the species in these bins
+  medians_predicted <- tapply(cc$prediction, cc$interval, median)
+  m.df <- data.frame(medians_predicted, interval=as.numeric(names(medians_predicted)))
+  medians_observed <- tapply(cc$ma_range, cc$interval, median)
+  m.df <- data.frame(m.df, medians_observed)
+  temp <- merge(cc, m.df, by="interval", all.x=TRUE)
+  temp <- data.frame(temp, run=rep(i, nrow(temp)))
+  # add interval name
+  temp$interval2 <- seq(0, interval.range, interval.size)[temp$interval]
+  # save stuff 
+  if(i==1){fin <- temp}else{fin <- rbind(fin, temp)}
+  # print progress
+   if(i %% 10==0) { cat(paste0("iteration: ", i, "\n")) }
+} # the bootstrap
+
+# Add the frequency per interval for weighting the regression:
+weights <- data.frame(table(fin$interval2))
+fin <- merge(fin, weights, by.x="interval2", by.y="Var1", all.x=TRUE)
+
+# Figure Model calibration 2, supplement of Finnegan et al. 2015 - Paleontological baselines
+ggplot(fin[!is.na(fin$order),], aes(x=interval2, y=medians_observed, weight=Freq))+
+  geom_point(alpha=1/50)+
+#  geom_bin2d()+
+  scale_x_continuous("gbm predicted duration (ma)")+
+  scale_y_continuous("median observed duration per interval (ma)")+
+  geom_smooth()+
+  facet_wrap(~order)
+
+ggplot(fin[!is.na(fin$order),], aes(x=prediction, y=ma_range))+
+  geom_point(alpha=1/50)+
+#  geom_bin2d()+
+  scale_x_continuous("gbm predicted duration (ma)")+
+  scale_y_continuous("median observed duration per interval (ma)")+
+  geom_smooth()+
+  facet_wrap(~order)
+
+
+# Get the taxonomic group level bias for each prediction bin. Take the predicted duration value for a living species from the gbm.predict and extract the empirically observed duration from the gam fit
+formula = y ~ s(x, bs = "cs")
+gam.boot.salientia <- gam(data=fin[fin$order=="Salientia",], medians_observed~s(interval2, bs="cs"), weights=Freq)
+gam.boot.urodela <- gam(data=fin[fin$order=="Urodela",], medians_observed~s(interval2, bs="cs"), weights=Freq)
+
+res$predict.gbm1.anura_correction <-  predict(gam.boot.salientia, data.frame(interval2=res$predict.gbm1))
+res$predict.gbm1.caudata_correction <-  predict(gam.boot.urodela, data.frame(interval2=res$predict.gbm1))
+
+# plot the effect
+par(mfrow=c(1,2))
+plot(res$predict.gbm1.anura_correction[res$order=="ANURA"]~res$predict.gbm1[res$order=="ANURA"],
+     xlim=c(0,15), ylim=c(0,50), main="Anura", xlab="gbm duration (ma)", ylab="corrected gbm duration (ma)")
+abline(a=0, b=1, lty=2)
+plot(res$predict.gbm1.caudata_correction[res$order=="CAUDATA"]~res$predict.gbm1[res$order=="CAUDATA"],
+     xlim=c(0,15), ylim=c(0,50), main="Caudata", xlab="gbm duration (ma)", ylab="corrected gbm duration (ma)")
+abline(a=0, b=1, lty=2)
+par(mfrow=c(1,1))
+
+# Combine corrected predictions
+predict.gbm1.comb <- c()
+for(i in 1:nrow(res)){
+  if(res$order[i]=="ANURA"){predict.gbm1.comb <- c(predict.gbm1.comb, res$predict.gbm1.anura_correction[i])}else{
+    predict.gbm1.comb <- c(predict.gbm1.comb, res$predict.gbm1.caudata_correction[i])
+  }
+}
+res$predict.gbm1.comb <- predict.gbm1.comb
+ggplot(res, aes(x=Red.List.status, y=predict.gbm1.comb))+
+  geom_boxplot(varwidth=TRUE)+
+  scale_y_log10()
+
+# add to other model results
+res2 <- melt(res[,c("Red.List.status", "predict.gam", "predict.rf",
+                    "predict.gbm1", "predict.gbm1.comb")])
+ggplot(res2, aes(x=Red.List.status, y=value))+
+  geom_boxplot(aes(fill=variable))+
+  scale_fill_discrete(name = "model types")+
+  scale_y_log10("predicted duration (log ma)")#+
+#  facet_wrap(~variable)
+
+kruskal.test(res$predict.gbm1.comb, res$Red.List.status)
+pairwise.wilcox.test(res$predict.gbm1.comb, res$Red.List.status, p.adjust.method = "fdr")
+```
+
+
+
+## Phylogenetic bias
+```{r phylogenetic bias}
+ggplot(extinct.raw[!is.na(extinct.raw$order),], aes(x=order, y=ma_range))+
+  geom_boxplot()+
+  scale_y_continuous("duration (ma)")
+pairwise.wilcox.test(extinct.raw$ma_range, extinct.raw$order, p.adjust.method = "fdr")
+```
+There is a phylogenetic bias on the duration with Allocaudata having longer durations than Lepospondlyi, Salientia and Temnospondyli. Temnospondyli show shorter duations than Urodela. Allocaudata and Urodela seem to have slightly longer durations on average.
+
+### Lissamphibian model
+```{r lissamphibia}
+liss.raw <- extinct.imp[extinct.imp$order %in% c("Urodela", "Salientia", "Parabatrachia"),]
+nrow(liss.raw)
+liss <- liss.raw[,c("ma_range", "lat_range", "gcd", "svl", "mean_lat",
+                 "min_lat", "abu_cat")]
+
+set.seed(825)
+gbmFit_liss <- train(ma_range ~ ., data = liss, method = "gbm", 
+                 trControl = gbmControl, verbose=FALSE,
+                 tuneGrid=gbmGrid)
+
+gbmFit_liss
+gbm.perf(gbmFit_liss$finalModel)
+ggplot(gbmFit_liss, nameInStrip = TRUE)
+ggplot(as.data.frame(summary(gbmFit_liss)),
+                  aes(x=var, y=rel.inf))+
+  geom_col()
+
+## Prediction
+predict.gbm.liss <- predict(gbmFit_liss, newdata = extant, n.trees = gbmFit_liss$bestTune$n.trees)
+res$predict.gbm.liss <- predict.gbm.liss
+
+res2 <- melt(res[,c("Red.List.status", "predict.gam", "predict.rf",
+                    "predict.gbm1", "predict.gbm1.comb", "predict.gbm.liss")])
+ggplot(res2, aes(x=Red.List.status, y=value))+
+  geom_boxplot(aes(fill=variable))+
+  scale_fill_discrete(name = "model types")+
+  scale_y_log10("predicted duration (log ma)")+
+  facet_wrap(~variable)
+
+kruskal.test(res$predict.gbm.liss, res$Red.List.status)
+pairwise.wilcox.test(res$predict.gbm.liss, res$Red.List.status, p.adjust.method = "fdr")
+```
+
+```{r habitat model}
+set.seed(825)
+imp_hab <- merge(extinct.imp, extinct.raw[,c("species", "hab.cat.b")])
+imp_hab <- imp_hab[,c("ma_range", "lat_range", "gcd", "svl", "mean_lat", "min_lat", "abu_cat", "hab.cat.b" )]
+gbmFit_hab <- train(ma_range ~ ., data = imp_hab, method = "gbm", 
+                 trControl = gbmControl, verbose=FALSE,
+                 tuneGrid=gbmGrid)
+
+gbmFit_hab
+ggplot(as.data.frame(summary(gbmFit_hab)),
+                  aes(x=var, y=rel.inf))+
+  geom_col()
+```
+
+
+```{r comparing models, eval=FALSE}
+# remember to set resamples="final" in the fitControl
+resamps <- resamples(list(GBM = gbmFit1,
+                          GBM_LISS = gbmFit_liss,
+                          RF = rfFit1,
+                          GBM_HAB = gbmFit_hab))
+summary(resamps)
+ggplot(data.frame)
+bwplot(resamps, layout = c(2, 1))
+# transform to ggplot
+
+difValues <- diff(resamps)
+difValues
+
+summary(difValues)
+bwplot(difValues, layout = c(2, 1))
+
+gbmFit1$results[which.min(gbmFit1$results$RMSE),]
+gbmFit_liss$results[which.min(gbmFit_liss$results$RMSE),]
+gbmFit_hab$results[which.min(gbmFit_hab$results$RMSE),]
+rfFit1$results[which.min(rfFit1$results$RMSE),]
+```
+
+
+
+
+## Null model
+Our null hypothesis is that we expect no connection between traits and extinction risk. A null model should represent a fit to a random dataset. However, the dataset does not have to be entirely random as this would create species trait combinations that do not make sense (being very rare but extreme widely distributed), just random for the response variable "duration". 
+
+```{r null model, eval=FALSE}
+null.data <- imp
+
+set.seed(2)
+null.data$ma_range <- sample(null.data$ma_range, replace=FALSE)
+  #rnorm(nrow(null.data), mean=mean(extinct$ma_range), sd=sd(extinct$ma_range))
+gbm.null <- gbm(data=null.data, log(ma_range+1) ~  lat_range + gcd + svl + mean_lat
+                      + min_lat + hab.cat.b + abu_cat, n.trees=n.trees, 
+                 shrinkage = shrinkage, interaction.depth=interaction.depth)
+summary(gbm.null)
+
+## Prediction
+predict.gbm.null <- predict(gbm.null, newdata = extant, best.iter)
+res$predict.gbm.null <- predict.gbm.null
+(gbm.null <- ggplot(res, aes(x=Red.List.status, y=predict.gbm.null))+
+  geom_boxplot(varwidth=TRUE)+
+  scale_y_log10()+
+  theme_classic())
+
+
+#### add to other model results
+res2 <- melt(res[,c("Red.List.status", "fit", "predict.gam1", "predict.gam.poisson",
+                    "predict.gam.nb", "predict.rf1", "predict.rf2", "predict.gam1.imp",
+                    "predict.gam.comb", "predict.gbm1", "predict.gbm.poisson", "predict.gbm1.comb",
+                    "predict.gbm.null")])
+ggplot(res2, aes(x=Red.List.status, y=value))+
+  geom_boxplot(aes(fill=variable))+
+  scale_y_log10()+
+  theme_classic()+
+  facet_wrap(~variable)
+
+kruskal.test(res$predict.gbm.null, res$Red.List.status)
+pairwise.wilcox.test(res$predict.gbm.null, res$Red.List.status, p.adjust.method = "fdr")
+
+# Bootstrap
+store_kw <- c()
+store_median <- matrix(ncol=8, nrow=500)
+for(i in 1:500){
+  null.data <- extinct
+  null.data$ma_range <- sample(null.data$ma_range, replace=FALSE)
+  gbm.null.boot <- gbm(data=null.data, log(ma_range+1) ~  lat_range + gcd + svl + mean_lat
+                      + min_lat + hab.cat.b + abu_cat, n.trees=100, 
+                 shrinkage = shrinkage, interaction.depth=interaction.depth)
+  predict.gbm.null.boot <- predict(gbm.null.boot, newdata = extant, n.trees=100)#
+  temp <- data.frame(prediction=predict.gbm.null.boot, group=extant$Red.List.status)
+  store_median[i,] <- tapply(temp$prediction, temp$group, median)
+  store_kw <- c(store_kw, kruskal.test(predict.gbm.null.boot, extant$Red.List.status)$p.value)
+  # print progress
+   if(i %% 10==0) { cat(paste0("iteration: ", i, "\n")) }
+}
+hist(store_kw, breaks=80, xlim=c(0,0.1))
+boxplot(store_median, names=c("DD", "LC", "NT", "VU", "EN", "CR", "EW", "EX"),
+        main="bootstrap null model prediction, n=500",
+        ylab="Median duration predicted (log)")
+boot.k <- melt(store_median)
+kruskal.test(boot.k$value, boot.k$X2)
+
+```

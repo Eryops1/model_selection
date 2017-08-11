@@ -1,0 +1,199 @@
+---
+title: "Model application"
+output:
+  html_document:
+    css: style.css
+    fig_width: 5
+    highlight: textmate
+    keep_md: yes
+    theme: journal
+    toc: yes
+    toc_float:
+      collapsed: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r read data}
+extinct <- read.csv("model_data2.csv")
+extant <- read.csv("living_data2.csv")
+```
+
+
+
+## Data description
+```{r description extant data}
+nrow(na.omit(extant))
+summary(extant)
+```
+
+
+```{r }
+extant <- extant[, colnames(extant) != "count"] 
+extant$complete_case <- complete.cases(extant)
+ext <- na.omit(extant)
+ext <- droplevels(ext)
+summary(ext)
+
+hist(ext$SVL, breaks = 40)
+barplot(table(ext$abu_cat))
+hist(ext$lat.range)
+hist(ext$maxGCD_extant)
+hist(ext$mean_lat)
+hist(ext$min_lat)
+```
+
+`r nrow(ext)` complete cases in the data. Body size distribution as expected (follows a negative binomial, cut off at the lower end). Same goes for count data, which is stronger skewed however. 
+
+```{r}
+library(ggplot2)
+ggplot(extant, aes(Red.List.status, fill=complete_case))+geom_bar()
+```
+
+
+```{r}
+ggplot(extant, aes(Family, fill=complete_case))+geom_bar()
+ggplot(extant, aes(hab.cat, fill=complete_case))+geom_bar()+scale_y_log10()#limits = c(0,400), oob = squish)
+```
+
+Habitat distribution looks similar to extinct species. Only very few species from high energy habitats only.
+
+# Data comparability
+Data from the fossil record and from living species can differ greatly, but also share some common points. Data on geographic ranges, body size and habitat are comparable without further adjustments (?), whereas comparing data on abundance from extinct and living species would be most likely to the disadvantage of the extinct species, caused by the in general low preservation probability of terrestrial organisms. Another variable that is not comparable without further adjustments is extinction risk, wich is defined as species duration in the fossil record, but as category in the IUCN Red List. 
+To bridge these differences between datasets, we chose to categorize data for abundance (mni_max and spec_max) and extinction risk (duration) for the extinct species data. 
+
+
+Applying the fossil data fitted model I will predict duration for extant species, which can be compared to their current assassment categories. Therefore, only abundance categorization has to be done.
+We regard EW and EX to be of the same results and therefore similar for our approach. DD species is not a category for extinction risk, therefore there is 6 categories for living species, which is in increasing order: LC, NT, VU, EN, CR, and EX.
+
+Abundance in the living dataset comes in 4 categories, which is why we categorize our extinct data the same.
+```{r abundance cluster check}
+extinct_cc <- extinct[complete.cases(extinct),]
+
+k2 <- kmeans(extinct_cc[, 4:5], 2)
+k3 <- kmeans(extinct_cc[, 4:5], 3)
+k4 <- kmeans(extinct_cc[, 4:5], 4)
+k5 <- kmeans(extinct_cc[, 4:5], 5)
+k6 <- kmeans(extinct_cc[, 4:5], 6)
+
+plot(c(2,3,4,5,6), 
+     c(k2$betweenss/k2$totss, k3$betweenss/k3$totss, k4$betweenss/k4$totss, 
+     k5$betweenss/k5$totss, k6$betweenss/k6$totss), type="b")
+```
+Clustering the data (using both specimens and mni values) shows that between sum of squares divided by total SS, as a measure of the goodness of the classification k-means, that there is much improvement increasing the number of clusters from 2 to 3 and from 3 to 4, but not much from 4 clusters on. Using 4 abundance categories is reasonable. 
+
+```{r clustering abundance}
+set.seed(20)
+mni_cluster <- kmeans(extinct_cc$mni_max, 4)
+
+test_clust <- kmeans(extinct_cc[, 4:5], 4, nstart = 20)
+ggplot(extinct_cc, aes(x=mni_max, y=spec_max, col=factor(test_clust$cluster)))+
+  geom_jitter(width=.1, height=.1)+
+  scale_y_log10()+
+  scale_x_log10()
+
+# rename clusters to be intuitive
+abu_cat <- mni_cluster$cluster
+abu_cat[mni_cluster$cluster==order(mni_cluster$centers)[1]] <- 1
+abu_cat[mni_cluster$cluster==order(mni_cluster$centers)[2]] <- 2
+abu_cat[mni_cluster$cluster==order(mni_cluster$centers)[3]] <- 3
+abu_cat[mni_cluster$cluster==order(mni_cluster$centers)[4]] <- 4
+
+extinct_cc <- cbind(extinct_cc, abu_cat)
+```
+
+## Variable names
+```{r}
+model.data <- extinct_cc[,c("ma_range", "lat_range", "gcd", "svl_pred", "mean_lat", "min_lat", "hab.cat.b", "abu_cat")]
+apply.data <- ext[,c("lat.range", "maxGCD_extant", "SVL", "mean_lat", "min_lat", "hab.cat", "abu_cat")]
+
+names(apply.data) <- tail(names(model.data), 7)
+```
+
+
+# Modelling
+```{r}
+library(effects)
+lm1 <- lm(data=model.data, log(ma_range+1) ~ lat_range + gcd + svl_pred + mean_lat + min_lat + hab.cat.b + abu_cat)
+plot(all.effects(lm1))
+
+predict.lm1 <- predict.lm(lm1, newdata = apply.data, interval="confidence")
+
+res <- cbind(ext, predict.lm1)
+
+ggplot(res, aes(x=Red.List.status, y=fit))+
+  geom_boxplot()+
+  scale_y_log10()
+
+kruskal.test(res$fit, res$Red.List.status)
+pairwise.wilcox.test(res$fit, res$Red.List.status, p.adjust.method = "fdr")
+```
+
+## Centroid-based clustering of the predicted duration results
+
+```{r}
+hist(res$fit, breaks=25)
+kk2 <- kmeans(res[, 14:16], 2)
+kk3 <- kmeans(res[, 14:16], 3)
+kk4 <- kmeans(res[, 14:16], 4)
+kk5 <- kmeans(res[, 14:16], 5)
+kk6 <- kmeans(res[, 14:16], 6)
+kk7 <- kmeans(res$fit, 7)
+plot(c(2,3,4,5,6,7), 
+     c(kk2$betweenss/kk2$totss, kk3$betweenss/kk3$totss, kk4$betweenss/kk4$totss, 
+     kk5$betweenss/kk5$totss, kk6$betweenss/kk6$totss, kk7$betweenss/kk7$totss), type="b")
+
+pred_cat <- kk7$cluster
+pred_cat[kk7$cluster==order(kk7$centers)[1]] <- "EX"
+pred_cat[kk7$cluster==order(kk7$centers)[2]] <- "EW"
+pred_cat[kk7$cluster==order(kk7$centers)[3]] <- "CR"
+pred_cat[kk7$cluster==order(kk7$centers)[4]] <- "EN"
+pred_cat[kk7$cluster==order(kk7$centers)[5]] <- "VU"
+pred_cat[kk7$cluster==order(kk7$centers)[6]] <- "NT"
+pred_cat[kk7$cluster==order(kk7$centers)[7]] <- "LC"
+
+res$pred_cat <- pred_cat
+table(pred_cat)
+res$pred_cat <- factor(res$pred_cat)
+res$pred_cat <- ordered(res$pred_cat, levels = c("LC", "NT", "VU", "EN", "CR", "EW", "EX"))
+
+ggplot(res, aes(pred_cat, fit))+
+  geom_boxplot(varwidth=TRUE)
+
+ggplot(res, aes(Red.List.status, fill=pred_cat))+
+  geom_bar(position = "fill")+ # fill, stack
+  scale_fill_brewer("lm prediction", palette = "Dark2")
+```
+
+## Other forms of clustering?
+Distribution-based clustering clusters points according to the underlying distributions of groups, not their distance to each other. That`s different from what I want.
+
+
+
+
+```{r turn-the-world-around}
+library(randomForest)
+rf_reverse <- randomForest(data=ext, Red.List.status ~ lat.range + maxGCD_extant + SVL + 
+                      mean_lat + min_lat + hab.cat + abu_cat, ntree=500)
+plot(rf_reverse)
+print(rf_reverse)
+
+mod.fossil.rf <- model.data[,-1]
+names(mod.fossil.rf) <- c("lat.range", "maxGCD_extant", "SVL", "mean_lat", "min_lat", 
+                          "hab.cat", "abu_cat")
+predict.rf_reverse <- predict(rf_reverse, newdata = mod.fossil.rf, interval="confidence")
+res2 <- cbind(model.data, predict.rf_reverse)
+
+ggplot(res2, aes(predict.rf_reverse, ma_range))+
+  geom_boxplot(varwidth=TRUE)+
+  scale_y_log10()
+```
+
+
+
+
+
+
+
+
+
